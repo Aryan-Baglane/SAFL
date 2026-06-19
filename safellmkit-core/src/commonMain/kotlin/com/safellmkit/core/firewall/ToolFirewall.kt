@@ -18,7 +18,7 @@ class ToolFirewall(
         if (toolCall.name !in allowedTools) {
             return GuardrailResult(
                 action = GuardrailAction.BLOCK,
-                riskScore = 100,
+                riskScore = 1.0f,
                 safeText = null,
                 findings = emptyList(),
                 messageToUser = "Tool '${toolCall.name}' is not allowed by policy."

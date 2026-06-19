@@ -8,6 +8,10 @@ import com.safellmkit.ml.NoOpSlmClassifier
 import com.safellmkit.ml.SlmClassifier
 import kotlin.math.max
 
+@Deprecated(
+    message = "Use com.safellmkit.sdk.SafeLLMClient for enforced chat. GuardrailsAgent does not gate provider calls.",
+    replaceWith = ReplaceWith("SafeLLMClient", "com.safellmkit.sdk.SafeLLMClient")
+)
 class GuardrailsAgent(
     private val engine: GuardrailsEngine,
     private val config: GuardrailsAgentConfig = GuardrailsAgentConfig(),
@@ -65,7 +69,7 @@ class GuardrailsAgent(
         )
 
         val newFindings = base.findings + mlFinding
-        val boostedRisk = max(base.riskScore, (mlProb * 100).toInt())
+        val boostedRisk = kotlin.math.max(base.riskScore, mlProb * 100f)
 
         val action = when {
             mlProb >= config.mlRiskThresholdBlock -> GuardrailAction.BLOCK
@@ -77,12 +81,16 @@ class GuardrailsAgent(
             GuardrailAction.ALLOW -> base.safeText
             GuardrailAction.SANITIZE -> base.safeText // rules already sanitized if needed
             GuardrailAction.BLOCK -> null
+            GuardrailAction.WARN -> base.safeText
+            GuardrailAction.REDACT -> base.safeText
         }
 
         val msg = when (action) {
             GuardrailAction.ALLOW -> base.messageToUser
             GuardrailAction.SANITIZE -> "Sanitized ⚠️ Suspicious prompt detected (ML confirmed)."
             GuardrailAction.BLOCK -> "Blocked 🚫 Jailbreak / policy bypass attempt detected (ML confirmed)."
+            GuardrailAction.WARN -> "Warning ⚠️ Suspicious prompt detected (ML confirmed)."
+            GuardrailAction.REDACT -> "Redacted ⚠️ Sensitive prompt content redacted (ML confirmed)."
         }
 
         return GuardrailResult(

@@ -1,0 +1,11 @@
+{
+    "0": "SAFE",
+    "1": "PROMPT_INJECTION",
+    "2": "JAILBREAK",
+    "3": "GCG",
+    "4": "PAIR",
+    "5": "CRESCENDO",
+    "6": "ROLEPLAY",
+    "7": "ENCODING_ATTACK",
+    "8": "PII"
+}

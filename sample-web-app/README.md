@@ -1,30 +1,36 @@
-# SafeLLMKit Web Demo App
+# SafeLLMKit Web Demo
 
-A React + Vite application demonstrating the **SafeLLMKit JS SDK** with ONNX integration.
+Light-themed **AI Firewall Console** demonstrating enforced guardrail gating with live SDK telemetry.
 
-## 🚀 Run Locally
+## Features
 
-1.  **Install SDK Dependencies:**
-    ```bash
-    cd ../safellmkit-js
-    npm install
-    ```
+- **3-column dashboard** — config/chat, pipeline telemetry, session memory
+- **Custom OpenRouter models** — search presets or type any model ID (e.g. `cohere/north-mini-code:free`)
+- **Provider call counter** — proves blocked prompts never reach OpenRouter
+- **Pipeline rail** — INT → HEUR → ONNX → LSTM → VSIM → AGGR animation
+- **Perplexity & SmoothLLM charts** — derived from real `safellmkit-js` inspection results
+- **Redis state machine, centroid drift, reputation curve**
 
-2.  **Install App Dependencies:**
-    ```bash
-    cd ../sample-web-app
-    npm install
-    ```
+## Run
 
-3.  **Start Dev Server:**
-    ```bash
-    npm run dev
-    ```
+```bash
+cd ../safellmkit-js && npm install
+cd ../sample-web-app && npm install && npm run dev
+```
 
-4.  Open `http://localhost:5173`.
+Open http://localhost:5173
 
-## 🧪 Features
-- **Prompt Input**: Enter safe or unsafe prompts.
-- **Real-time Analysis**: See Risk Score, Action (Block/Sanitize), and Findings.
-- **ML Integration**: Uses `jailbreak_classifier.onnx` (loaded from `public/`).
-- **Gemini Integration**: Optionally sends safe prompts to Google Gemini (requires API Key).
+## Custom model
+
+1. Open the **Target model endpoint** dropdown
+2. Type any OpenRouter model slug (e.g. `meta-llama/llama-3-70b-instruct`)
+3. Click **+ Use custom** or **Apply**
+
+## Enforcement flow
+
+```
+prompt → safellmkit-js (input) → session memory → BLOCK? → stop
+      → OpenRouter (only if allowed) → output scan → display
+```
+
+Toggle **SDK GUARD OFF** to compare bypass behavior.

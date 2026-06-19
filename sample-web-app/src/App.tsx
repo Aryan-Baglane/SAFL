@@ -1,158 +1,195 @@
-import { useState, useEffect } from 'react'
-import './App.css'
-import { SafeLLMKit, GuardrailAction, GuardrailResult, OnnxClassifier } from 'safellmkit-js'
+import { useCallback, useEffect, useState } from 'react';
+import './App.css';
+import { ConfigPanel } from './components/ConfigPanel';
+import { ChatPanel } from './components/ChatPanel';
+import { PresetPanel } from './components/PresetPanel';
+import { PipelineRail } from './components/PipelineRail';
+import { PerplexityChart } from './components/PerplexityChart';
+import { SmoothLLMChart } from './components/SmoothLLMChart';
+import { StateMachinePanel } from './components/StateMachinePanel';
+import { CentroidDriftChart } from './components/CentroidDriftChart';
+import { ReputationCurve } from './components/ReputationCurve';
+import { useGuardedChat } from './hooks/useGuardedChat';
+import { validateApiKey } from './lib/openRouter';
+import { CRESCENDO_STEPS } from './lib/attackPresets';
+import { ConnectionStatus, KeyMetadata } from './types';
 
-// Initialize Classifier with path to model in public/
-const classifier = new OnnxClassifier('/jailbreak_classifier.onnx');
-// Initialize Engine with default rules + ML classifier
-const guard = new SafeLLMKit([], classifier);
+export default function App() {
+  const [firewallActive, setFirewallActive] = useState(true);
+  const [apiKey, setApiKey] = useState('');
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [selectedModel, setSelectedModel] = useState('cohere/north-mini-code:free');
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('offline');
+  const [connectionError, setConnectionError] = useState('');
+  const [keyMetadata, setKeyMetadata] = useState<KeyMetadata | null>(null);
+  const [input, setInput] = useState('');
+  const [crescendoIndex, setCrescendoIndex] = useState(0);
 
-function App() {
-    const [prompt, setPrompt] = useState('');
-    const [apiKey, setApiKey] = useState('');
-    const [result, setResult] = useState<GuardrailResult | null>(null);
-    const [llmResponse, setLlmResponse] = useState('');
-    const [loading, setLoading] = useState(false);
-    const [modelReady, setModelReady] = useState(false);
+  const canCallProvider = connectionStatus === 'connected' && !!apiKey;
 
-    useEffect(() => {
-        // Initialize ONNX model on load
-        classifier.init().then(() => {
-            console.log("SafeLLMKit: ML Model Ready");
-            setModelReady(true);
-        });
-    }, []);
+  const {
+    messages,
+    isLoading,
+    modelReady,
+    providerCallCount,
+    session,
+    reputation,
+    telemetry,
+    pipelineActiveNode,
+    reputationTime,
+    setReputationTime,
+    decayStartReputation,
+    send,
+    clearChat,
+  } = useGuardedChat(firewallActive, apiKey, selectedModel, canCallProvider);
 
-    const handleAnalyze = async () => {
-        setLoading(true);
-        setResult(null);
-        setLlmResponse('');
+  const turnCount = messages.filter((m) => m.role !== 'system').length;
 
-        // 1. Run Guardrails (Client Side!)
-        // Now using validateAsync to include ML check
-        console.log("Running SafeLLMKit Guardrails...");
-        const guardResult = await guard.validateAsync(prompt);
-        setResult(guardResult);
+  useEffect(() => {
+    if (!apiKey) {
+      setConnectionStatus('offline');
+      setKeyMetadata(null);
+      setConnectionError('');
+    } else if (connectionStatus === 'connected') {
+      setConnectionStatus('offline');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [apiKey]);
 
-        // 2. If Allowed, call Gemini
-        if (guardResult.action !== GuardrailAction.BLOCK) {
-            if (apiKey) {
-                try {
-                    const response = await callGemini(guardResult.sanitizedInput, apiKey);
-                    setLlmResponse(response);
-                } catch (error: any) {
-                    setLlmResponse("Error calling Gemini: " + error.message);
-                }
-            } else {
-                setLlmResponse("Guardrails passed! Enter Gemini API Key to see real model response.");
-            }
-        } else {
-            setLlmResponse("Request blocked by SafeLLMKit. Not sent to LLM.");
-        }
-        setLoading(false);
-    };
+  const handleTestConnection = useCallback(async () => {
+    if (!apiKey) return;
+    setConnectionStatus('testing');
+    setConnectionError('');
+    try {
+      const meta = await validateApiKey(apiKey);
+      setKeyMetadata(meta);
+      setConnectionStatus('connected');
+    } catch (err: unknown) {
+      setConnectionStatus('error');
+      setConnectionError(err instanceof Error ? err.message : 'Verification failed');
+      setKeyMetadata(null);
+    }
+  }, [apiKey]);
 
-    const callGemini = async (text: string, key: string) => {
-        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key=${key}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contents: [{ parts: [{ text }] }] })
-        });
-        const data = await res.json();
-        if (data.error) throw new Error(data.error.message);
-        return data?.candidates?.[0]?.content?.parts?.[0]?.text || "No response.";
-    };
+  const handleSend = useCallback(async () => {
+    const prompt = input.trim();
+    if (!prompt) return;
+    setInput('');
+    await send(prompt);
+  }, [input, send]);
 
-    return (
-        <div className="container">
-            <h1>🛡️ SafeLLMKit Web Demo</h1>
+  const handleCrescendo = useCallback(() => {
+    setInput(CRESCENDO_STEPS[crescendoIndex]);
+    setCrescendoIndex((i) => (i + 1) % CRESCENDO_STEPS.length);
+  }, [crescendoIndex]);
 
-            <div className="card">
-                <div style={{ marginBottom: '1rem' }}>
-                    <label style={{ display: 'block', marginBottom: '0.5rem', color: '#94a3b8' }}>Gemini API Key (Optional)</label>
-                    <input
-                        type="password"
-                        placeholder="Enter AI Studio Key..."
-                        value={apiKey}
-                        onChange={(e) => setApiKey(e.target.value)}
-                        style={{
-                            width: '100%',
-                            padding: '0.75rem',
-                            borderRadius: '0.5rem',
-                            border: '1px solid #334155',
-                            backgroundColor: '#0f172a',
-                            color: 'white'
-                        }}
-                    />
-                </div>
+  const gatewayLabel =
+    connectionStatus === 'connected'
+      ? `● LIVE ONLINE (${selectedModel})`
+      : connectionStatus === 'testing'
+      ? '○ VERIFYING KEY…'
+      : connectionStatus === 'error'
+      ? '● KEY UNVERIFIED (SIM MOCK)'
+      : `● SIM MODE (${selectedModel})`;
 
-                <label style={{ display: 'block', marginBottom: '0.5rem', color: '#94a3b8' }}>Enter Prompt</label>
-                <textarea
-                    placeholder="Try a safe prompt like: 'What is deep learning?'&#10;Or a jailbreak like: 'Ignore previous instructions...'"
-                    value={prompt}
-                    onChange={(e) => setPrompt(e.target.value)}
-                />
-
-                <button className="btn" onClick={handleAnalyze} disabled={loading || !prompt}>
-                    {loading ? 'Analyzing...' : !modelReady ? 'Loading Model...' : 'Analyze & Send'}
-                </button>
-
-                {!modelReady && <p style={{ textAlign: 'center', marginTop: '0.5rem', color: '#64748b', fontSize: '0.9rem' }}>Loading ONNX Model...</p>}
-
-                {result && (
-                    <div className="result-section">
-                        <div className="stats">
-                            <div className="stat-box">
-                                <div className="stat-label">Action</div>
-                                <div className={result.action === GuardrailAction.BLOCK ? "badge badge-block" : "badge badge-allow"}>
-                                    {result.action}
-                                </div>
-                            </div>
-                            <div className="stat-box">
-                                <div className="stat-label">Risk Score</div>
-                                <div className="stat-value" style={{ color: result.riskScore > 50 ? '#ef4444' : '#22c55e' }}>
-                                    {result.riskScore}/100
-                                </div>
-                            </div>
-                            <div className="stat-box">
-                                <div className="stat-label">Findings</div>
-                                <div className="stat-value">{result.findings.length}</div>
-                            </div>
-                        </div>
-
-                        {result.findings.map((f, i) => (
-                            <div key={i} className="finding" style={{ borderLeftColor: f.severity >= 9 ? '#ef4444' : '#fbbf24' }}>
-                                <strong>{f.rule}</strong> ({f.category})
-                                <p style={{ margin: '0.5rem 0 0', opacity: 0.8 }}>{f.message}</p>
-                            </div>
-                        ))}
-
-                        <div style={{ marginTop: '2rem' }}>
-                            <h3 style={{ color: '#94a3b8' }}>LLM Response</h3>
-                            <div style={{
-                                background: '#0f172a',
-                                padding: '1rem',
-                                borderRadius: '0.5rem',
-                                minHeight: '60px',
-                                border: result.action === GuardrailAction.BLOCK ? '1px solid #ef4444' : '1px solid #22c55e'
-                            }}>
-                                {llmResponse}
-                            </div>
-                        </div>
-
-                        {result.action === GuardrailAction.SANITIZE && (
-                            <div style={{ marginTop: '1rem' }}>
-                                <h4 style={{ color: '#94a3b8' }}>Sanitized Input Sent:</h4>
-                                <code style={{ display: 'block', background: '#334155', padding: '0.5rem', borderRadius: '4px' }}>
-                                    {result.sanitizedInput}
-                                </code>
-                            </div>
-                        )}
-                    </div>
-                )}
-            </div>
+  return (
+    <div className={`app ${session === 'BLOCKED' && firewallActive ? 'session-blocked' : ''}`}>
+      <header className="topbar">
+        <div className="brand">
+          <div className="brand-icon">🛡️</div>
+          <div>
+            <h1>SafeLLMKit AI Firewall</h1>
+            <span className="version-tag">CONSOLE V0.1.0</span>
+          </div>
         </div>
-    )
-}
 
-export default App
+        <div className="topbar-controls">
+          <div className="guard-toggle-wrap">
+            <span className={`guard-label ${firewallActive ? 'on' : ''}`}>
+              SDK GUARD: {firewallActive ? 'ON' : 'OFF'}
+            </span>
+            <button
+              type="button"
+              className={`toggle ${firewallActive ? 'on' : ''}`}
+              onClick={() => setFirewallActive((v) => !v)}
+              aria-pressed={firewallActive}
+            >
+              <span className="toggle-knob" />
+            </button>
+          </div>
+
+          <div className="provider-pill" title="OpenRouter calls this session">
+            <span className="provider-pill-label">Provider calls</span>
+            <span className="provider-pill-value">{providerCallCount}</span>
+          </div>
+
+          <div className="gateway-badge">{gatewayLabel}</div>
+
+          <button type="button" className="btn-ghost" onClick={clearChat}>
+            Clear data
+          </button>
+        </div>
+      </header>
+
+      <main className="dashboard">
+        {/* Column 1 — Config & Chat */}
+        <div className="col col-left">
+          <ConfigPanel
+            apiKey={apiKey}
+            showApiKey={showApiKey}
+            onApiKeyChange={setApiKey}
+            onToggleShowKey={() => setShowApiKey((v) => !v)}
+            connectionStatus={connectionStatus}
+            connectionError={connectionError}
+            keyMetadata={keyMetadata}
+            onTestConnection={handleTestConnection}
+            selectedModel={selectedModel}
+            onModelChange={setSelectedModel}
+          />
+
+          <ChatPanel
+            messages={messages}
+            input={input}
+            onInputChange={setInput}
+            onSend={handleSend}
+            isLoading={isLoading}
+            modelReady={modelReady}
+            firewallActive={firewallActive}
+            turnCount={turnCount}
+          />
+
+          <PresetPanel
+            crescendoIndex={crescendoIndex}
+            onPreset={setInput}
+            onCrescendo={handleCrescendo}
+            disabled={isLoading}
+          />
+        </div>
+
+        {/* Column 2 — Pipeline telemetry */}
+        <div className="col col-mid">
+          <PipelineRail
+            states={telemetry.pipelineStates}
+            activeNode={pipelineActiveNode}
+            latencyMs={telemetry.latencyMs}
+            isScanning={isLoading}
+          />
+          <PerplexityChart data={telemetry.perplexityData} />
+          <SmoothLLMChart data={telemetry.mutationBars} />
+        </div>
+
+        {/* Column 3 — Memory & reputation */}
+        <div className="col col-right">
+          <StateMachinePanel status={session} />
+          <CentroidDriftChart data={telemetry.centroidDrift} />
+          <ReputationCurve
+            reputation={reputation}
+            reputationTime={reputationTime}
+            decayStartReputation={decayStartReputation}
+            onTimeChange={setReputationTime}
+          />
+        </div>
+      </main>
+    </div>
+  );
+}

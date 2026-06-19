@@ -1,23 +1,30 @@
 # Gradle
 .gradle/
 build/
+**/build/
 local.properties
 
 # IntelliJ / VSCode
 .idea/
 .vscode/
 *.iml
+*.ipr
+*.iws
 
 # Node / JS
 node_modules/
 dist/
+*.log
 npm-debug.log
 yarn-error.log
+pnpm-debug.log
 .env
 
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
 venv/
 env/
 .pytest_cache/
@@ -25,6 +32,17 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+.DS_Store?
+Icon?
+
+# Generated artifacts
+*.class
+*.jar
+*.war
+*.ear
+*.iml
+*.keystore
+outputs/
 
 # SafeLLMKit
 *.hprof

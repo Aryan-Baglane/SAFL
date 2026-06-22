@@ -10,9 +10,11 @@ class MockLlmProvider(
 ) : LlmProvider {
 
     val callCount = AtomicInteger(0)
+    val lastRequest = java.util.concurrent.atomic.AtomicReference<ChatRequest?>(null)
 
     override suspend fun generate(request: ChatRequest): ProviderResponse {
         callCount.incrementAndGet()
+        lastRequest.set(request)
         return ProviderResponse(text = responseText)
     }
 }

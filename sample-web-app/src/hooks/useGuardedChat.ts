@@ -9,6 +9,25 @@ function uid() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function normalizeRiskScore(riskScore: number) {
+  return riskScore <= 1 ? riskScore : riskScore / 100;
+}
+
+function deriveAttackSignal(result: GuardrailResult, prompt: string) {
+  const risk = normalizeRiskScore(result.riskScore);
+  const lower = prompt.toLowerCase();
+  const hasOverrideFinding = result.findings.some((f) => {
+    const haystack = `${f.category} ${f.rule} ${f.message}`.toLowerCase();
+    return haystack.includes('prompt_injection') || haystack.includes('instruction override') || haystack.includes('jailbreak');
+  });
+  const markerHit = ['ignore', 'override', 'bypass', 'jailbreak', 'system prompt'].some((token) => lower.includes(token));
+
+  if (result.action === GuardrailAction.BLOCK) return Math.max(risk, 0.9);
+  if (result.action === GuardrailAction.SANITIZE) return Math.max(risk, 0.6);
+  if (hasOverrideFinding || markerHit || result.findings.length > 0) return Math.max(risk, 0.4);
+  return 0;
+}
+
 function blockedMessage(result: GuardrailResult, stage: 'input' | 'output' | 'session') {
   const top = result.findings[0]?.message;
   if (stage === 'session') {
@@ -69,12 +88,12 @@ export function useGuardedChat(
   const [providerCallCount, setProviderCallCount] = useState(0);
   const [lastInspection, setLastInspection] = useState<GuardrailResult | null>(null);
   const [session, setSession] = useState<SessionStatus>('NORMAL');
-  const [reputation, setReputation] = useState(1);
+  const [reputation, setReputation] = useState(0);
   const [crescendoScore, setCrescendoScore] = useState(0);
   const [telemetry, setTelemetry] = useState<TelemetrySnapshot>(DEFAULT_TELEMETRY);
   const [pipelineActiveNode, setPipelineActiveNode] = useState<number | null>(null);
-  const [reputationTime, setReputationTime] = useState(31);
-  const [decayStartReputation, setDecayStartReputation] = useState(1);
+  const [reputationTime, setReputationTime] = useState(0);
+  const [decayStartReputation, setDecayStartReputation] = useState(0);
 
   useEffect(() => {
     const classifier = new OnnxClassifier('/jailbreak_classifier.onnx');
@@ -89,9 +108,7 @@ export function useGuardedChat(
   }, []);
 
   useEffect(() => {
-    const r0 = decayStartReputation;
-    const t = reputationTime;
-    const next = r0 + (1.0 - r0) * (1.0 - Math.exp(-t / 30));
+    const next = memoryRef.current.previewReputationAfterInactivity(reputationTime);
     setReputation(Number(next.toFixed(4)));
   }, [reputationTime, decayStartReputation]);
 
@@ -102,12 +119,12 @@ export function useGuardedChat(
     setProviderCallCount(0);
     setLastInspection(null);
     setSession('NORMAL');
-    setReputation(1);
+    setReputation(0);
     setCrescendoScore(0);
     setTelemetry(DEFAULT_TELEMETRY);
     setPipelineActiveNode(null);
-    setReputationTime(31);
-    setDecayStartReputation(1);
+    setReputationTime(0);
+    setDecayStartReputation(0);
     setMessages([
       {
         id: 'sys-1',
@@ -186,8 +203,9 @@ export function useGuardedChat(
         }
 
         const inputInspection = await guard.validateAsync(trimmed);
-        const snapBefore = memoryRef.current.recordTurn(trimmed, false);
-        const escalate = memoryRef.current.shouldEscalateToBlock(snapBefore.crescendoScore);
+        const attackSignal = deriveAttackSignal(inputInspection, trimmed);
+        const preview = memoryRef.current.previewTurn(trimmed, attackSignal, false);
+        const escalate = memoryRef.current.shouldEscalateToBlock(preview.crescendoScore, preview.reputation);
         const inputBlocked = inputInspection.action === GuardrailAction.BLOCK || escalate;
 
         const effectiveInspection: GuardrailResult = escalate
@@ -201,14 +219,17 @@ export function useGuardedChat(
                   category: 'SESSION_MEMORY',
                   rule: 'CRESCENDO_ESCALATION',
                   severity: 10,
-                  message: `Multi-turn escalation (score=${snapBefore.crescendoScore})`,
+                  message: `Multi-turn escalation (score=${preview.crescendoScore})`,
                 },
               ],
             }
           : inputInspection;
 
+        const effectiveAttackSignal = deriveAttackSignal(effectiveInspection, trimmed);
+        const snapBefore = memoryRef.current.recordTurn(trimmed, effectiveAttackSignal, inputBlocked);
+
         const isDanger = effectiveInspection.action === GuardrailAction.BLOCK;
-        const riskNorm = effectiveInspection.riskScore / 100;
+        const riskNorm = normalizeRiskScore(effectiveInspection.riskScore);
 
         await animatePipeline(
           setPipelineActiveNode,
@@ -230,12 +251,9 @@ export function useGuardedChat(
         setLastInspection(effectiveInspection);
         setSession(snapBefore.status);
         setCrescendoScore(snapBefore.crescendoScore);
-
-        if (session !== 'BLOCKED') {
-          const newRep = Math.max(0.08, 1.0 - riskNorm * 0.9);
-          setDecayStartReputation(newRep);
-          setReputationTime(0);
-        }
+        setDecayStartReputation(snapBefore.reputation);
+        setReputationTime(0);
+        setReputation(snapBefore.reputation);
 
         const displayAction =
           effectiveInspection.action === GuardrailAction.SANITIZE
@@ -255,7 +273,6 @@ export function useGuardedChat(
         setMessages((m) => [...m, userMessage]);
 
         if (inputBlocked) {
-          memoryRef.current.recordTurn(trimmed, true);
           const assistantMessage: ChatMessage = {
             id: uid(),
             role: 'assistant',
@@ -268,6 +285,7 @@ export function useGuardedChat(
           setMessages((m) => [...m, assistantMessage]);
           const snap = memoryRef.current.snapshot(snapBefore.crescendoScore);
           setSession(snap.status);
+          setReputation(snap.reputation);
           return {
             blocked: true,
             userMessage,
@@ -359,7 +377,7 @@ export function useGuardedChat(
         setIsLoading(false);
       }
     },
-    [apiKey, canCallProvider, firewallActive, isLoading, model, session]
+    [apiKey, canCallProvider, firewallActive, isLoading, model]
   );
 
   return {

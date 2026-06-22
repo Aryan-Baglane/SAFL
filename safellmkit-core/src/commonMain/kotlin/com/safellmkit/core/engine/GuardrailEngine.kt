@@ -2,6 +2,7 @@ package com.safellmkit.core.engine
 
 import com.safellmkit.core.model.*
 import com.safellmkit.core.policy.*
+import com.safellmkit.ml.model.RiskPrediction
 import com.safellmkit.ml.onnx.OnnxRiskModel
 import com.safellmkit.ml.ood.MahalanobisDetector
 import com.safellmkit.ml.model.RiskClassifier
@@ -90,43 +91,61 @@ class GuardrailEngine(
     }
 
     suspend fun inspect(turn: ConversationTurn): GuardrailResult {
+        val contextTexts = turn.additionalContext.filter { it.isNotBlank() }
+        val combinedInput = if (contextTexts.isEmpty()) turn.content else turn.content + "\n\n" + contextTexts.joinToString("\n\n")
+
         // 1. FeatureExtractor & RuleEngine
-        val features = PromptFeatureExtractor.extract(turn.content)
+        val features = PromptFeatureExtractor.extract(combinedInput)
         
         val activeRules = policy?.let { p ->
             if (turn.role == "assistant") p.outputRules else p.inputRules
         } ?: emptyList()
 
         val findings = activeRules.flatMap { rp ->
-            rp.rule.check(turn.content).filter { it.severity >= rp.minSeverityToTrigger }
+            rp.rule.check(combinedInput).filter { it.severity >= rp.minSeverityToTrigger }
         }
 
         val heuristicRisk = PromptFeatureExtractor.heuristicRisk(features)
 
         // 2. MiniLMEngine
         val prediction = if (riskClassifier.supportsInference) {
-            riskClassifier.predict(turn.content)
+            predictAcrossInputs(turn.content, contextTexts)
         } else {
             null
         }
 
-        val mlProbability = prediction?.probability ?: mlProbabilityFn?.invoke(turn.content)?.coerceIn(0f, 1f)
-        val mlRisk = mlProbability ?: 0f
+        val isUncertain = prediction?.let {
+            (it.margin < config.entropyMarginThreshold || it.uncertain) &&
+            (it.attackClass == AttackTaxonomy.SAFE || it.attackClass == AttackTaxonomy.UNKNOWN)
+        } ?: false
 
-        var attackClass = prediction?.attackClass ?: when {
-            features.jailbreakHits > 0 -> AttackTaxonomy.JAILBREAK
-            features.instructionOverrideHits > 0 -> AttackTaxonomy.PROMPT_INJECTION
-            mlProbability != null && mlProbability > 0.8f -> AttackTaxonomy.JAILBREAK
-            else -> AttackTaxonomy.SAFE
+        val mlProbability = prediction?.probability ?: sequenceOf(turn.content, *contextTexts.toTypedArray())
+            .mapNotNull { mlProbabilityFn?.invoke(it)?.coerceIn(0f, 1f) }
+            .maxOrNull()
+        val mlRisk = if (isUncertain) {
+            maxOf(mlProbability ?: 0f, config.uncertaintyPenalty)
+        } else {
+            mlProbability ?: 0f
+        }
+
+        var attackClass = if (isUncertain) {
+            AttackTaxonomy.UNKNOWN
+        } else {
+            prediction?.attackClass ?: when {
+                features.jailbreakHits > 0 -> AttackTaxonomy.JAILBREAK
+                features.instructionOverrideHits > 0 -> AttackTaxonomy.PROMPT_INJECTION
+                mlProbability != null && mlProbability > 0.8f -> AttackTaxonomy.JAILBREAK
+                else -> AttackTaxonomy.SAFE
+            }
         }
 
         // 3. Embedding Provider
         val currentEmbedding = if (embeddingProvider != null) {
-            embeddingProvider.embed(turn.content)
+            embeddingProvider.embed(combinedInput)
         } else if (prediction != null && prediction.embedding.isNotEmpty()) {
             prediction.embedding
         } else {
-            HashingEmbeddingProvider().embed(turn.content)
+            HashingEmbeddingProvider().embed(combinedInput)
         }
 
         // User Memory Gateway / Cooldown Setup (Phase 3)
@@ -135,13 +154,15 @@ class GuardrailEngine(
         val rawUserState = userMemory.getUserState(userId)
         val currentTimestamp = if (turn.timestampMs > 0L) turn.timestampMs else currentTimeMs()
         
-        var decayedReputation = rawUserState.reputationScore
-        if (rawUserState.lastUpdated > 0L && currentTimestamp > rawUserState.lastUpdated) {
-            val seconds = (currentTimestamp - rawUserState.lastUpdated) / 1000f
-            decayedReputation *= kotlin.math.exp(-seconds / 30f)
+        val inactivityMs = if (rawUserState.lastUpdated > 0L) currentTimestamp - rawUserState.lastUpdated else 0L
+        val shouldDecayReputation = rawUserState.lastUpdated > 0L && inactivityMs >= config.reputationDecayInactivityMs
+        val decayedReputation = if (shouldDecayReputation) {
+            (rawUserState.reputationScore * config.reputationDecayFactorOnInactivity).coerceIn(0f, 1f)
+        } else {
+            rawUserState.reputationScore
         }
 
-        val hasUserCooledDown = (rawUserState.lastUpdated > 0L && (currentTimestamp - rawUserState.lastUpdated) / 1000f >= 30f)
+        val hasUserCooledDown = rawUserState.lastUpdated > 0L && inactivityMs >= config.reputationDecayInactivityMs
         val previousUserState = if (hasUserCooledDown) {
             rawUserState.copy(
                 attackCount = 0,
@@ -156,14 +177,25 @@ class GuardrailEngine(
         }
         val isUserBlockedSessionStart = previousUserState.conversationStatus == ConversationStatus.BLOCKED
 
-        // 4. MemoryEngine
-        val centroid = if (currentEmbedding.isNotEmpty()) {
-            memory.rollingCentroid(turn.sessionId, config.historyWindow)
-        } else null
-        
-        val semanticSimilarity = centroid?.let { cosine(it, currentEmbedding).coerceIn(0f, 1f) } ?: 1f
-        val semanticDriftScore = 1f - semanticSimilarity
-        val driftRisk = semanticDriftScore
+        // 4. MemoryEngine - Step & Cumulative Drift (Fix 2)
+        val sessionEmbeddings = if (currentEmbedding.isNotEmpty()) {
+            memory.recentEmbeddings(turn.sessionId, 10000)
+        } else emptyList()
+
+        val stepSimilarity = if (sessionEmbeddings.isNotEmpty() && currentEmbedding.isNotEmpty()) {
+            cosine(sessionEmbeddings.last(), currentEmbedding).coerceIn(0f, 1f)
+        } else 1f
+        val stepDrift = 1f - stepSimilarity
+
+        val cumulativeSimilarity = if (sessionEmbeddings.isNotEmpty() && currentEmbedding.isNotEmpty()) {
+            cosine(sessionEmbeddings.first(), currentEmbedding).coerceIn(0f, 1f)
+        } else 1f
+        val cumulativeDrift = 1f - cumulativeSimilarity
+
+        // Set semanticSimilarity and semanticDriftScore to maintain compatibility
+        val semanticSimilarity = stepSimilarity
+        val semanticDriftScore = stepDrift
+        val driftRisk = stepDrift
 
         // Cross-Session Embedding Drift (Phase 4)
         val userCentroid = if (previousUserState.embeddingHistory.isNotEmpty()) {
@@ -272,25 +304,52 @@ class GuardrailEngine(
         }
 
         // 10. LLMValidator
-        val llmRisk = llmValidatorFn?.invoke(turn.content)?.coerceIn(0f, 1f)
+        val llmRisk = llmValidatorFn?.invoke(combinedInput)?.coerceIn(0f, 1f)
 
-        // 11. RiskAggregator
-        val totalWeightUsed = if (llmRisk != null) 1.0f else (1.0f - config.llmWeight)
-        val rawRisk = (
-            heuristicRisk * config.heuristicWeight +
-            driftRisk * config.driftWeight +
-            perplexityRisk * config.perplexityWeight +
-            smoothRisk * config.smoothWeight +
-            mahalanobisRisk * config.mahalanobisWeight +
-            mlRisk * config.mlWeight +
-            temporalRisk * config.temporalWeight +
-            vectorSearchRisk * config.vectorWeight +
-            (llmRisk ?: 0f) * config.llmWeight
+        // 11. RiskAggregator & Hard Gate check (Fix 1)
+        val isHardGateBlocked = (
+            (mlProbability != null && mlProbability >= config.classifierBlockThreshold) ||
+            (temporalRisk >= config.temporalBlockThreshold) ||
+            (mahalanobisScore >= config.mahalanobisBlockThreshold)
         )
-        val combinedRisk = (rawRisk / totalWeightUsed).coerceIn(0f, 1f)
 
-        // Reputation score update: R_new = 0.9 * R_old + 0.1 * attackScore (Phase 3)
-        val userReputationScore = (0.9f * decayedReputation + 0.1f * combinedRisk).coerceIn(0f, 1f)
+        val combinedRisk: Float
+        if (isHardGateBlocked) {
+            combinedRisk = 1.0f
+            val triggerSignal = when {
+                mlProbability != null && mlProbability >= config.classifierBlockThreshold -> "Classifier (C = $mlProbability)"
+                temporalRisk >= config.temporalBlockThreshold -> "Temporal (T = $temporalRisk)"
+                else -> "Mahalanobis (M = $mahalanobisScore)"
+            }
+            println("[GuardrailEngine] Decision triggered by hard-gate path: $triggerSignal exceeded threshold")
+        } else {
+            val totalWeightUsed = if (llmRisk != null) 1.0f else (1.0f - config.llmWeight)
+            val rawRisk = (
+                heuristicRisk * config.heuristicWeight +
+                stepDrift * config.stepDriftWeight +
+                cumulativeDrift * config.cumulativeDriftWeight +
+                perplexityRisk * config.perplexityWeight +
+                smoothRisk * config.smoothWeight +
+                mahalanobisRisk * config.mahalanobisWeight +
+                mlRisk * config.mlWeight +
+                temporalRisk * config.temporalWeight +
+                vectorSearchRisk * config.vectorWeight +
+                (llmRisk ?: 0f) * config.llmWeight
+            )
+            combinedRisk = (rawRisk / totalWeightUsed).coerceIn(0f, 1f)
+            println("[GuardrailEngine] Decision triggered by weighted-sum path: combinedRisk = $combinedRisk")
+        }
+
+        // Reputation score update: saturating accumulation during active attack windows.
+        val currentAttackSignal = when {
+            attackClass != AttackTaxonomy.SAFE -> maxOf(combinedRisk, mlProbability ?: 0f, heuristicRisk)
+            else -> 0f
+        }.coerceIn(0f, 1f)
+        val userReputationScore = if (currentAttackSignal > 0f) {
+            decayedReputation + currentAttackSignal * (1f - decayedReputation)
+        } else {
+            decayedReputation
+        }.coerceIn(0f, 1f)
 
         // Cross-session risk blend
         val crossSessionRisk = (userReputationScore * 0.5f + crossSessionDrift * 0.2f + nearestUserAttackSimilarity * 0.3f).coerceIn(0f, 1f)
@@ -329,6 +388,7 @@ class GuardrailEngine(
         }
 
         val mathAction = when {
+            isHardGateBlocked -> GuardrailAction.BLOCK
             previousStatus == ConversationStatus.BLOCKED -> GuardrailAction.BLOCK
             isUserBlockedSessionStart -> GuardrailAction.BLOCK
             attackClass == AttackTaxonomy.GCG -> GuardrailAction.BLOCK
@@ -367,7 +427,7 @@ class GuardrailEngine(
         val isUserBlocked = (
             isUserBlockedSessionStart ||
             action == GuardrailAction.BLOCK ||
-            userReputationScore >= config.blockThreshold
+            userReputationScore >= config.reputationBlockThreshold
         )
         val newUserStatus = when {
             isUserBlocked -> ConversationStatus.BLOCKED
@@ -384,6 +444,7 @@ class GuardrailEngine(
             taxonomyHistory = previousUserState.taxonomyHistory + attackClass,
             reputationScore = userReputationScore,
             lastUpdated = currentTimestamp,
+            lastAttackTimestampMs = if (attackClass != AttackTaxonomy.SAFE) currentTimestamp else previousUserState.lastAttackTimestampMs,
             conversationStatus = newUserStatus
         )
         userMemory.updateUserState(newUserState)
@@ -394,9 +455,9 @@ class GuardrailEngine(
         val newBlockedCount = (previousState?.blockedCount ?: 0) + (if (action == GuardrailAction.BLOCK) 1 else 0)
 
         val newStatus = when {
-            action == GuardrailAction.BLOCK || rNew >= config.blockThreshold || previousStatus == ConversationStatus.BLOCKED -> ConversationStatus.BLOCKED
-            rNew >= config.warnThreshold -> ConversationStatus.ACTIVE_ATTACK
-            rNew >= 0.35f -> ConversationStatus.SUSPICIOUS
+            action == GuardrailAction.BLOCK || blendedRisk >= config.blockThreshold || previousStatus == ConversationStatus.BLOCKED -> ConversationStatus.BLOCKED
+            blendedRisk >= config.warnThreshold -> ConversationStatus.ACTIVE_ATTACK
+            blendedRisk >= 0.35f -> ConversationStatus.SUSPICIOUS
             else -> ConversationStatus.NORMAL
         }
 
@@ -405,7 +466,7 @@ class GuardrailEngine(
                 sessionId = turn.sessionId,
                 totalTurns = (previousState?.totalTurns ?: 0) + 1,
                 lastTurnIndex = turn.turnIndex,
-                lastRiskScore = rNew,
+                lastRiskScore = blendedRisk,
                 lastSemanticSimilarity = semanticSimilarity,
                 lastPerplexityScore = perplexityScore,
                 lastSmoothVarianceScore = smoothVarianceScore,
@@ -423,7 +484,8 @@ class GuardrailEngine(
             if (features.jailbreakHits > 0) add("jailbreak keywords detected")
             if (features.instructionOverrideHits > 0) add("instruction override detected")
             if (features.piiHits > 0) add("possible PII detected")
-            if (semanticSimilarity < config.driftThreshold) add("semantic drift across turns")
+            if (stepSimilarity < config.driftThreshold) add("step semantic drift across turns")
+            if (cumulativeSimilarity < config.driftThreshold) add("cumulative semantic drift across turns")
             if (perplexityScore > 0.65f) add("prompt anomaly / perplexity spike")
             if (smoothVarianceScore > 0.30f) add("SmoothLLM instability detected")
             if (mahalanobisScore > 6f) add("latent-space anomaly detected")
@@ -440,6 +502,9 @@ class GuardrailEngine(
             }
             if (crossSessionDrift > 0.40f) {
                 add("Cross-session drift detected")
+            }
+            if (contextTexts.isNotEmpty() && (features.instructionOverrideHits > 0 || (mlProbability ?: 0f) > 0.5f)) {
+                add("Additional context triggered detection")
             }
         }.ifEmpty { listOf("no strong attack indicators") }
 
@@ -479,7 +544,9 @@ class GuardrailEngine(
             userReputationScore = userReputationScore,
             crossSessionDrift = crossSessionDrift,
             crossSessionRisk = crossSessionRisk,
-            userState = newUserState
+            userState = newUserState,
+            stepDrift = stepDrift,
+            cumulativeDrift = cumulativeDrift
         )
     }
 
@@ -489,6 +556,11 @@ class GuardrailEngine(
             safe = rp.rule.sanitize(safe)
         }
         return safe
+    }
+
+    private fun predictAcrossInputs(primary: String, additionalContext: List<String>): RiskPrediction? {
+        val inputs = listOf(primary) + additionalContext
+        return inputs.map { riskClassifier.predict(it) }.maxByOrNull { it.probability }
     }
 
     private fun cosine(a: FloatArray, b: FloatArray): Float {

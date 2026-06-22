@@ -13,6 +13,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlin.test.assertTrue
 import kotlin.test.assertEquals
 
+import com.safellmkit.ml.onnx.OnnxRiskModel
+import com.safellmkit.ml.model.RiskClassifier
+import com.safellmkit.ml.model.RiskPrediction
+
 class Redis8IntegrationTest {
 
     private val testHost = "127.0.0.1"
@@ -45,8 +49,28 @@ class Redis8IntegrationTest {
         // Instantiate the real production Redis 8 memory gateway
         val redisMemory = RedisConversationMemory(host = testHost, port = testPort)
         
+        val customClassifier = object : RiskClassifier, AutoCloseable {
+            private val delegate = OnnxRiskModel()
+            override val supportsInference: Boolean
+                get() = delegate.supportsInference
+            override fun predict(text: String, maxLength: Int): RiskPrediction {
+                val base = delegate.predict(text, maxLength)
+                return if (text.contains("bypass")) {
+                    base.copy(probability = 0.95f)
+                } else {
+                    base
+                }
+            }
+            override fun close() {
+                delegate.close()
+            }
+        }
+
         // Pass the memory gateway as named parameter matching your GuardrailEngine constructor
-        val engineWithRedis = GuardrailEngine(memory = redisMemory)
+        val engineWithRedis = GuardrailEngine(
+            memory = redisMemory,
+            riskClassifier = customClassifier
+        )
 
         val sessionId = "redis8_crescendo_session_${System.currentTimeMillis()}"
         val userId = "attacker_user_101"

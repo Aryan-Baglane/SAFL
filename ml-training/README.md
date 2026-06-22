@@ -142,7 +142,7 @@ Copy to runtime:
 cp outputs/temporal_model.onnx ../safellmkit-ml/src/commonMain/resources/assets/
 ```
 
-> The stock script uses synthetic data for plumbing validation. Replace `dummy_x` / `dummy_y` with real multi-turn embedding sequences for production quality.
+> **Finding & Fix (June 2026):** The original training script used pure random Gaussian noise (`np.random.randn`) for both training inputs and labels, which failed to model genuine sequential transition dynamics (from benign to escalation). We replaced it with `generate_synthetic_temporal_data`, which builds sequence trajectories with a true temporal transition signal: a benign prefix of random low-variance vectors followed by cohesive, normalized direction vectors scaling up in magnitude representing attack classes (PAIR or CRESCENDO) starting at varying index `k`.
 
 ---
 

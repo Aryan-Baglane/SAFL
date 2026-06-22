@@ -47,9 +47,49 @@ class BiLSTMTemporalClassifier(nn.Module):
         pooled = torch.mean(lstm_out, dim=1) # [batch, hidden_dim * 2]
         return self.classifier(pooled)
 
+def generate_synthetic_temporal_data(num_samples=1000, seq_len=5, embedding_dim=384):
+    # Class 0: SAFE (all turns are benign)
+    # Class 1: PAIR (turns 0..k-1 are benign, turn k..seq_len-1 are PAIR escalation)
+    # Class 2: CRESCENDO (turns 0..k-1 are benign, turn k..seq_len-1 are CRESCENDO escalation)
+    
+    np.random.seed(42)
+    pair_direction = np.random.randn(embedding_dim)
+    pair_direction /= np.linalg.norm(pair_direction)
+    
+    crescendo_direction = np.random.randn(embedding_dim)
+    crescendo_direction /= np.linalg.norm(crescendo_direction)
+    
+    X = np.zeros((num_samples, seq_len, embedding_dim))
+    y = np.zeros(num_samples, dtype=int)
+    
+    for i in range(num_samples):
+        cls = np.random.randint(0, 3)
+        y[i] = cls
+        
+        if cls == 0:
+            for t in range(seq_len):
+                X[i, t] = np.random.randn(embedding_dim) * 0.1
+        else:
+            k = np.random.randint(1, seq_len) # escalation starts at turn k
+            for t in range(seq_len):
+                if t < k:
+                    X[i, t] = np.random.randn(embedding_dim) * 0.1
+                else:
+                    direction = pair_direction if cls == 1 else crescendo_direction
+                    strength = 0.5 + 0.1 * (t - k)
+                    X[i, t] = direction * strength + np.random.randn(embedding_dim) * 0.05
+                    
+    # Normalize each turn's embedding vector to unit length
+    for i in range(num_samples):
+        for t in range(seq_len):
+            norm = np.linalg.norm(X[i, t])
+            if norm > 0:
+                X[i, t] /= norm
+                
+    return X, y
+
 def train_and_export():
-    dummy_x = np.random.randn(1000, 5, 384) # Sequence window size of 5 turns
-    dummy_y = np.random.randint(0, 3, 1000)   # Classes: 0: SAFE, 1: PAIR, 2: CRESCENDO
+    dummy_x, dummy_y = generate_synthetic_temporal_data(1000, 5, 384)
     
     dataset = TemporalSecurityDataset(dummy_x, dummy_y)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)

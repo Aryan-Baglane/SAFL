@@ -132,7 +132,7 @@ Key files:
 
 - `engine/GuardrailEngine.kt` — full pipeline
 - `sdk/PolicyEnforcementGate.kt` — input/output enforcement
-- `PromptFeatureExtractor.kt` — heuristics
+- `PromptFeatureExtractor.kt` — heuristics (cheap fast-path filter only; never short-circuits to ALLOW)
 - `memory/UserMemoryEngine.kt` — cross-session state
 
 ---

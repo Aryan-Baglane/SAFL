@@ -30,6 +30,7 @@ data class ConversationTurn(
     val turnIndex: Int,
     val role: String = "user",
     val content: String,
+    val additionalContext: List<String> = emptyList(),
     val timestampMs: Long = 0L,
     val userId: String = "default-user"
 )
@@ -45,6 +46,7 @@ data class UserState(
     val sessionHistory: List<String> = emptyList(),
     val reputationScore: Float = 0f,
     val lastUpdated: Long = 0L,
+    val lastAttackTimestampMs: Long = 0L,
     val conversationStatus: ConversationStatus = ConversationStatus.NORMAL,
     val embeddingHistory: List<List<Float>> = emptyList(),
     val recentAttackVectors: List<List<Float>> = emptyList()
@@ -75,7 +77,17 @@ data class GuardrailConfig(
     val mlWeight: Float = 0.20f,
     val temporalWeight: Float = 0.15f,
     val vectorWeight: Float = 0.03f,
-    val llmWeight: Float = 0.02f
+    val llmWeight: Float = 0.02f,
+    val classifierBlockThreshold: Float = 0.85f,
+    val temporalBlockThreshold: Float = 0.80f,
+    val mahalanobisBlockThreshold: Float = 40.0f,
+    val reputationBlockThreshold: Float = 0.85f,
+    val reputationDecayInactivityMs: Long = 6L * 60L * 60L * 1000L,
+    val reputationDecayFactorOnInactivity: Float = 0.5f,
+    val stepDriftWeight: Float = 0.05f,
+    val cumulativeDriftWeight: Float = 0.05f,
+    val entropyMarginThreshold: Float = 0.20f,
+    val uncertaintyPenalty: Float = 0.40f
 )
 
 @Serializable
@@ -123,7 +135,9 @@ data class GuardrailResult(
     val userReputationScore: Float = 0f,
     val crossSessionDrift: Float = 0f,
     val crossSessionRisk: Float = 0f,
-    val userState: UserState? = null
+    val userState: UserState? = null,
+    val stepDrift: Float = 0f,
+    val cumulativeDrift: Float = 0f
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -163,6 +177,8 @@ data class GuardrailResult(
         if (crossSessionDrift != other.crossSessionDrift) return false
         if (crossSessionRisk != other.crossSessionRisk) return false
         if (userState != other.userState) return false
+        if (stepDrift != other.stepDrift) return false
+        if (cumulativeDrift != other.cumulativeDrift) return false
 
         return true
     }
@@ -197,6 +213,8 @@ data class GuardrailResult(
         result = 31 * result + crossSessionDrift.hashCode()
         result = 31 * result + crossSessionRisk.hashCode()
         result = 31 * result + (userState?.hashCode() ?: 0)
+        result = 31 * result + stepDrift.hashCode()
+        result = 31 * result + cumulativeDrift.hashCode()
         return result
     }
 

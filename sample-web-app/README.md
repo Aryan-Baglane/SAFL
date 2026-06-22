@@ -9,7 +9,7 @@ Light-themed **AI Firewall Console** demonstrating enforced guardrail gating wit
 - **Provider call counter** — proves blocked prompts never reach OpenRouter
 - **Pipeline rail** — INT → HEUR → ONNX → LSTM → VSIM → AGGR animation
 - **Perplexity & SmoothLLM charts** — derived from real `safellmkit-js` inspection results
-- **Redis state machine, centroid drift, reputation curve**
+- **Redis-style state machine, centroid drift, SDK-aligned reputation decay preview**
 
 ## Run
 
@@ -34,3 +34,9 @@ prompt → safellmkit-js (input) → session memory → BLOCK? → stop
 ```
 
 Toggle **SDK GUARD OFF** to compare bypass behavior.
+
+## SDK-aligned updates
+
+- Session reputation now follows the SDK’s saturating accumulation model instead of recovering every turn.
+- Reputation decay is shown as an inactivity-based preview (`6h` gate, then decay), matching the latest SDK behavior.
+- Blocked turns are recorded once in session memory, fixing prior over-counting in the demo escalation path.

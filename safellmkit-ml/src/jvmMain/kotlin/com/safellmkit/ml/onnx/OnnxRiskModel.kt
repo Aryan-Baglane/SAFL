@@ -122,15 +122,31 @@ actual class OnnxRiskModel actual constructor(
         }
 
         val probs = softmax(logits)
+        val sortedProbs = probs.sortedDescending()
+        val maxProb = sortedProbs.getOrNull(0) ?: 0f
+        val secondMaxProb = sortedProbs.getOrNull(1) ?: 0f
+        val margin = maxProb - secondMaxProb
+
+        var entropy = 0f
+        for (p in probs) {
+            if (p > 0f) {
+                entropy -= (p * kotlin.math.log2(p.toDouble())).toFloat()
+            }
+        }
+
+        val uncertain = margin < 0.20f
         val predictedIndex = probs.indices.maxByOrNull { probs[it] } ?: 0
-        val attackClass = LabelMapLoader.labels[predictedIndex] ?: AttackTaxonomy.UNKNOWN
+        val attackClass = if (uncertain && predictedIndex == 0) AttackTaxonomy.UNKNOWN else (LabelMapLoader.labels[predictedIndex] ?: AttackTaxonomy.UNKNOWN)
         val probability = (1f - probs[0]).coerceIn(0f, 1f)
 
         return RiskPrediction(
             probability = probability,
             attackClass = attackClass,
             embedding = embedding,
-            logits = logits
+            logits = logits,
+            uncertain = uncertain,
+            margin = margin,
+            entropy = entropy
         )
     }
 

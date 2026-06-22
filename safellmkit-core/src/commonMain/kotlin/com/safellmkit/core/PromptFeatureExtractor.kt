@@ -5,6 +5,12 @@ import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
 
+/**
+ * WARNING: This rule-based heuristics layer is a cheap, fast-path filter for unsophisticated attacks ONLY.
+ * It must never be used as the sole basis for an ALLOW decision. A prompt passing this layer with zero flags
+ * must still undergo full MiniLM classification and Mahalanobis scoring. Heuristics are only allowed to ADD risk,
+ * never to short-circuit or bypass other detection pipeline stages to ALLOW.
+ */
 object PromptFeatureExtractor {
 
     private val jailbreakRegexes = listOf(

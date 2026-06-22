@@ -15,14 +15,15 @@ class SafeLLMClient internal constructor(
     private val defaultSessionId: String
 ) : AutoCloseable {
 
-    suspend fun chat(prompt: String): ChatResponse =
-        chat(userId = defaultUserId, sessionId = defaultSessionId, prompt = prompt)
+    suspend fun chat(prompt: String, additionalContext: List<ContextBlock> = emptyList()): ChatResponse =
+        chat(userId = defaultUserId, sessionId = defaultSessionId, prompt = prompt, additionalContext = additionalContext)
 
-    suspend fun chat(userId: String, sessionId: String, prompt: String): ChatResponse {
+    suspend fun chat(userId: String, sessionId: String, prompt: String, additionalContext: List<ContextBlock> = emptyList()): ChatResponse {
         val request = ChatRequest(
             userId = userId,
             sessionId = sessionId,
-            prompt = prompt
+            prompt = prompt,
+            additionalContext = additionalContext
         )
         return PolicyEnforcementGate.execute(
             engine = engine,

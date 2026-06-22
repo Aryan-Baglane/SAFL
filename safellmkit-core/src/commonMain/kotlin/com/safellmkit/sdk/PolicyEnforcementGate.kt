@@ -26,6 +26,7 @@ object PolicyEnforcementGate {
             turnIndex = turnIndex,
             role = "user",
             content = request.prompt,
+            additionalContext = request.additionalContext.map { it.content },
             userId = request.userId
         )
 
@@ -42,10 +43,42 @@ object PolicyEnforcementGate {
 
         val promptForProvider = resolveSafePrompt(inputResult, request.prompt)
 
+        // Inspect additionalContext blocks (Fix 4)
+        val safeContextBlocks = mutableListOf<ContextBlock>()
+        for (block in request.additionalContext) {
+            val contextTurn = ConversationTurn(
+                sessionId = request.sessionId,
+                turnIndex = turnIndex,
+                role = "user",
+                content = block.content,
+                additionalContext = emptyList(),
+                userId = request.userId
+            )
+            val contextResult = inspectSafely(engine, contextTurn, policy, stage = "input_context")
+                ?: return failClosedResponse(
+                    stage = "input_context",
+                    message = "Guardrail inspection failed on context block before provider call"
+                )
+            val contextBlockMsg = shouldBlockInput(contextResult, policy)
+            if (contextBlockMsg != null) {
+                return toBlockedResponse(contextResult, contextBlockMsg, stage = "input_context", providerCalled = false)
+            }
+            val safeContent = resolveSafePrompt(contextResult, block.content)
+            safeContextBlocks.add(block.copy(content = safeContent))
+        }
+
+        val assembledPrompt = if (safeContextBlocks.isEmpty()) {
+            promptForProvider
+        } else {
+            promptForProvider + "\n\nContext:\n" + safeContextBlocks.joinToString("\n") { 
+                "[Source: ${it.source ?: "unknown"}]: ${it.content}" 
+            }
+        }
+
         val providerResponse: ProviderResponse
         try {
             providerResponse = provider.generate(
-                request.copy(prompt = promptForProvider, turnIndex = turnIndex)
+                request.copy(prompt = assembledPrompt, turnIndex = turnIndex, additionalContext = safeContextBlocks)
             )
         } catch (e: Exception) {
             return if (policy.failClosedOnError) {
@@ -64,6 +97,7 @@ object PolicyEnforcementGate {
             turnIndex = turnIndex + 1,
             role = "assistant",
             content = providerResponse.text,
+            additionalContext = emptyList(),
             userId = request.userId
         )
 

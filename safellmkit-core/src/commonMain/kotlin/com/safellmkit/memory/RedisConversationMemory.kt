@@ -63,7 +63,7 @@ class RedisConversationMemory(
         val jsonStr = json.encodeToString(RedisSessionState.serializer(), sessionState)
         runRedis { write, read ->
             write.writeRespCommand(listOf("SET", "session:$sessionId:state", jsonStr))
-            read.readRespResponse() // Consume response
+            read.readRespResponse() // Consume response OK
         }
     }
 
@@ -77,12 +77,80 @@ class RedisConversationMemory(
 
     override suspend fun append(turn: ConversationTurn, embedding: FloatArray) {
         executeOrFallback({ fallback.append(turn, embedding) }) {
+            // 1. Persist the state engine json blob
             val state = getSessionState(turn.sessionId)
             val updatedTurns = state.turns + turn
             val updatedEmbeddings = state.embeddings + listOf(embedding.toList())
             saveSessionState(turn.sessionId, state.copy(turns = updatedTurns, embeddings = updatedEmbeddings))
+
+            // 2. Synchronously write vector indices to global index spaces via Redis 8 native VADD
+            // Syntax: VADD key VALUES dim element
+            val vectorString = embedding.joinToString(" ") { it.toString() }
+            val vectorIndexKey = "global:attack_vectors"
+            val elementId = "turn:${turn.sessionId}:${turn.timestamp}"
+
+            runRedis { write, read ->
+                write.writeRespCommand(listOf(
+                    "VADD", 
+                    vectorIndexKey, 
+                    "VALUES", 
+                    embedding.size.toString(), 
+                    vectorString
+                ))
+                read.readRespResponse() // Consume VADD response integer
+
+                // Attach payload string descriptor metadata using VSETATTR
+                write.writeRespCommand(listOf(
+                    "VSETATTR",
+                    vectorIndexKey,
+                    elementId,
+                    "prompt_id:${turn.sessionId}"
+                ))
+                read.readRespResponse() // Consume VSETATTR response OK
+            }
         }
     }
+
+    override suspend fun queryVectorSimilarity(embedding: FloatArray): Float {
+        return executeOrFallback({ 0f }) {
+            // Redis 8 parses float vectors directly as whitespace-delimited numerical text strings
+            val vectorString = embedding.joinToString(" ") { it.toString() }
+            val vectorIndexKey = "global:attack_vectors"
+
+            runRedis { write, read ->
+                // Native Syntax: VSIM key VALUES dim vector COUNT n
+                write.writeRespCommand(listOf(
+                    "VSIM",
+                    vectorIndexKey,
+                    "VALUES",
+                    embedding.size.toString(),
+                    vectorString,
+                    "COUNT",
+                    "1"
+                ))
+                val response = read.readRespResponse()
+                parseRedis8VectorSearchResponse(response)
+            }
+        }
+    }
+
+    private fun parseRedis8VectorSearchResponse(resp: Any?): Float {
+        // Redis 8 VSIM returns an array payload containing match strings and explicit similarity score floats
+        if (resp !is List<*>) return 0f
+        if (resp.isEmpty()) return 0f
+        
+        // Iterating across returning pairs [elementId, similarityScore]
+        // Since we query COUNT 1, check the secondary property directly if available
+        val similarityValue = resp.getOrNull(1) ?: return 0f
+        return when (similarityValue) {
+            is ByteArray -> similarityValue.decodeToString().toFloatOrNull() ?: 0f
+            is String -> similarityValue.toFloatOrNull() ?: 0f
+            is Long -> similarityValue.toFloat()
+            else -> 0f
+        }
+    }
+
+    // --- Keep interface overrides for fallback tracking ---
 
     override suspend fun rollingCentroid(sessionId: String, historyWindow: Int): FloatArray? {
         return executeOrFallback({ fallback.rollingCentroid(sessionId, historyWindow) }) {
@@ -140,48 +208,7 @@ class RedisConversationMemory(
         }
     }
 
-    override suspend fun queryVectorSimilarity(embedding: FloatArray): Float {
-        return executeOrFallback({ 0f }) {
-            val queryVectorBytes = embedding.toByteArray()
-            runRedis { write, read ->
-                write.writeRespCommand(listOf(
-                    "FT.SEARCH",
-                    "attack_idx",
-                    "*=>[KNN 1 @vector \$query_vector AS similarity]",
-                    "PARAMS",
-                    "2",
-                    "query_vector",
-                    queryVectorBytes,
-                    "DIALECT",
-                    "2"
-                ))
-                val response = read.readRespResponse()
-                parseVectorSearchResponse(response)
-            }
-        }
-    }
-
-    private fun parseVectorSearchResponse(resp: Any?): Float {
-        if (resp !is List<*>) return 0f
-        if (resp.isEmpty() || resp[0] as? Long == 0L) return 0f
-        val fields = resp.getOrNull(2) as? List<*> ?: return 0f
-        for (i in 0 until fields.size - 1 step 2) {
-            val key = when (val k = fields[i]) {
-                is ByteArray -> k.decodeToString()
-                is String -> k
-                else -> null
-            }
-            if (key == "similarity") {
-                val value = when (val v = fields[i + 1]) {
-                    is ByteArray -> v.decodeToString()
-                    is String -> v
-                    else -> null
-                }
-                return value?.toFloatOrNull() ?: 0f
-            }
-        }
-        return 0f
-    }
+    // --- Low level RESP Protocol Socket Writers and Readers ---
 
     private suspend fun ByteWriteChannel.writeRespCommand(args: List<Any>) {
         writeStringUtf8("*${args.size}\r\n")
@@ -244,17 +271,5 @@ class RedisConversationMemory(
             }
             else -> throw Exception("Unknown RESP type: $type")
         }
-    }
-
-    private fun FloatArray.toByteArray(): ByteArray {
-        val bytes = ByteArray(this.size * 4)
-        for (i in this.indices) {
-            val intBits = this[i].toBits()
-            bytes[i * 4] = (intBits and 0xFF).toByte()
-            bytes[i * 4 + 1] = ((intBits shr 8) and 0xFF).toByte()
-            bytes[i * 4 + 2] = ((intBits shr 16) and 0xFF).toByte()
-            bytes[i * 4 + 3] = ((intBits shr 24) and 0xFF).toByte()
-        }
-        return bytes
     }
 }

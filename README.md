@@ -75,17 +75,52 @@ A prompt filter usually runs one check (regex or one model) and returns a score.
 
 ## 2. High-level architecture
 
+SafeLLMKit is designed as a single enforcement gate with layered detection inside the SDK. Your app talks to `SafeLLMClient`, and every request flows through the guardrail pipeline before an LLM provider is called.
+
 ```
-┌──────────────┐     ┌─────────────────────────────────────────┐     ┌──────────────┐
-│  Your app    │────▶│  SafeLLMClient  (public SDK facade)       │────▶│  LLM provider│
-│              │     │  PolicyEnforcementGate                    │     │  OpenRouter… │
-└──────────────┘     │    └─▶ GuardrailEngine (internal)       │     └──────────────┘
-                     └─────────────────────────────────────────┘
+┌──────────────┐
+│  Your app    │
+└──────┬───────┘
+       │
+       ▼
+┌──────────────────────────────────────────────────────────┐
+│                  SafeLLMClient / SDK facade              │
+│  - PolicyEnforcementGate                                 │
+│  - SafeLLM builder + config                              │
+│  - Request/response interceptor                          │
+│                                                          │
+│    ┌───────────────────────────────────────────────────┐ │
+│    │              GuardrailEngine                      │ │
+│    │  - Rule checks, feature extraction, ML inference  │ │
+│    │  - Session/user memory, drift + OOD detection     │ │
+│    │  - SmoothLLM / Temporal BiLSTM / risk aggregation │ │
+│    │  - Block / warn / redact decisions               │ │
+│    └───────────────────────────────────────────────────┘ │
+│                                                          │
+└──────────────┬───────────────────────────────────────────┘
+               │
+               ▼
+       ┌──────────────┐
+       │ LLM provider │
+       │ OpenAI,      │
+       │ OpenRouter,  │
+       │ Gemini, etc. │
+       └──────────────┘
 ```
+
+### Beautiful architecture summary
+
+- `SafeLLMClient` is the public SDK entrypoint and the only path to the provider.
+- `PolicyEnforcementGate` ensures every prompt/response is inspected and enforced.
+- `GuardrailEngine.inspect()` runs a rich, multi-stage decision pipeline.
+- The architecture is intentionally layered so that no single check is relied on.
+- Detection is both:
+  - rule-based and explainable, and
+  - model-driven with ONNX, drift, perturbation, and temporal analysis.
 
 ### Detection pipeline (inside `GuardrailEngine.inspect`)
 
-Each user or assistant turn passes through these steps in order:
+Each user or assistant turn passes through these stages:
 
 | Step | Component | What it does |
 |------|-----------|--------------|
@@ -99,7 +134,7 @@ Each user or assistant turn passes through these steps in order:
 | 8 | **Mahalanobis OOD** | `MahalanobisDetector` — latent-space distance from training distribution. |
 | 9 | **SmoothLLM** | Perturbs input, re-scores; high variance ⇒ adversarial instability. |
 | 10 | **Temporal BiLSTM** | `TemporalRiskModel` — sequence of last N embeddings; detects Crescendo/PAIR. |
-| 11 | **Risk aggregation** | Weighted blend of heuristic, ML, drift, perplexity, temporal, vector search. |
+| 11 | **Risk aggregation** | Weighted blend of heuristics, ML, drift, perplexity, temporal, vector search. |
 | 12 | **State machine** | Updates `ConversationStatus` / user `conversationStatus` (NORMAL → BLOCKED). |
 | 13 | **Action resolver** | Merges rule action + math action → `ALLOW`, `WARN`, `REDACT`, or `BLOCK`. |
 
